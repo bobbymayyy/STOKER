@@ -1,0 +1,70 @@
+#!/usr/bin/python3
+from __future__ import annotations
+
+import argparse
+import grp
+import os
+import re
+import sys
+from pathlib import Path
+
+import yaml
+
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Enroll a host into a STOKER inventory")
+    parser.add_argument("name")
+    parser.add_argument("address")
+    parser.add_argument("--inventory", default="discovered")
+    parser.add_argument("--group", default="discovered")
+    parser.add_argument("--user", default="stoker")
+    parser.add_argument("--port", type=int, default=22)
+    args = parser.parse_args()
+
+    if os.geteuid() != 0:
+        parser.error("inventory enrollment changes controller state and must be run with sudo")
+    if not NAME_RE.fullmatch(args.name) or not NAME_RE.fullmatch(args.group):
+        parser.error("name and group may contain only letters, digits, dot, underscore, and dash")
+    if not 1 <= args.port <= 65535:
+        parser.error("port must be between 1 and 65535")
+
+    root = Path("/opt/stoker/inventory")
+    inventory = Path(args.inventory)
+    if not inventory.is_absolute():
+        inventory = root / inventory
+    path = inventory / "hosts.yaml" if inventory.suffix not in {".yaml", ".yml"} else inventory
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        stoker_gid = grp.getgrnam("stoker").gr_gid
+    except KeyError:
+        stoker_gid = -1
+    os.chown(path.parent, 0, stoker_gid)
+    os.chmod(path.parent, 0o750)
+    if path.exists():
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    else:
+        data = {}
+    if not isinstance(data, dict):
+        parser.error(f"inventory root is not a YAML mapping: {path}")
+
+    all_group = data.setdefault("all", {})
+    children = all_group.setdefault("children", {})
+    group = children.setdefault(args.group, {})
+    hosts = group.setdefault("hosts", {})
+    hosts[args.name] = {
+        "ansible_host": args.address,
+        "ansible_user": args.user,
+        "ansible_port": args.port,
+    }
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    os.chown(path, 0, stoker_gid)
+    os.chmod(path, 0o640)
+    print(f"Enrolled {args.name} ({args.address}) in {path}")
+    print(f"Test with: ansible -i {path} {args.name} -m ansible.builtin.ping")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

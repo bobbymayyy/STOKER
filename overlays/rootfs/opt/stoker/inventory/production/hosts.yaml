@@ -1,0 +1,5 @@
+---
+all:
+  children:
+    managed_nodes:
+      hosts: {}

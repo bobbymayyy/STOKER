@@ -1,0 +1,31 @@
+---
+- name: Validate the STOKER Ansible controller
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+  tasks:
+    - name: Confirm required STOKER directories exist
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /opt/stoker/projects
+        - /opt/stoker/inventory
+        - /opt/stoker/roles
+        - /opt/stoker/collections
+        - /opt/stoker/artifacts
+      register: stoker_paths
+
+    - name: Require each controller directory
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isdir
+        fail_msg: "Missing STOKER controller directory: {{ item.item }}"
+      loop: "{{ stoker_paths.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Report controller readiness
+      ansible.builtin.debug:
+        msg: "STOKER controller bootstrap validation passed on {{ ansible_facts.hostname }}."

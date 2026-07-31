@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""Render and apply STOKER's shared downstream network configuration."""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Iterable
+
+import yaml
+
+INTERFACE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,15}$")
+AUTO_VALUES = {"", "auto", None}
+
+
+class NetworkConfigError(RuntimeError):
+    pass
+
+
+def load_modules(path: Path) -> dict[str, Any]:
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError as exc:
+        raise NetworkConfigError(f"module configuration not found: {path}") from exc
+    except yaml.YAMLError as exc:
+        raise NetworkConfigError(f"invalid module configuration: {exc}") from exc
+    modules = data.get("modules")
+    if not isinstance(modules, dict):
+        raise NetworkConfigError("module configuration must contain a modules mapping")
+    return modules
+
+
+def module_config(modules: dict[str, Any], name: str) -> dict[str, Any]:
+    module = modules.get(name, {})
+    if not isinstance(module, dict) or not module.get("enabled", False):
+        return {}
+    configuration = module.get("configuration", {})
+    if not isinstance(configuration, dict):
+        raise NetworkConfigError(f"modules.{name}.configuration must be a mapping")
+    return configuration
+
+
+def interface_sort_key(name: str, sys_class_net: Path = Path("/sys/class/net")) -> tuple[int, str]:
+    try:
+        index = int((sys_class_net / name / "ifindex").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        index = 2**31 - 1
+    return index, name
+
+
+def list_candidate_interfaces(sys_class_net: Path = Path("/sys/class/net")) -> list[str]:
+    if not sys_class_net.is_dir():
+        return []
+    all_interfaces = [entry.name for entry in sys_class_net.iterdir() if entry.name != "lo"]
+    physical = [name for name in all_interfaces if (sys_class_net / name / "device").exists()]
+    selected = physical or all_interfaces
+    return sorted(selected, key=lambda name: interface_sort_key(name, sys_class_net))
+
+
+def dhcp_interfaces(root: Path = Path("/")) -> list[str]:
+    paths = [root / "etc/network/interfaces"]
+    interfaces_dir = root / "etc/network/interfaces.d"
+    if interfaces_dir.is_dir():
+        paths.extend(sorted(path for path in interfaces_dir.iterdir() if path.is_file()))
+    found: list[str] = []
+    pattern = re.compile(r"^\s*iface\s+(\S+)\s+inet\s+dhcp(?:\s|$)")
+    for path in paths:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            match = pattern.match(line)
+            if match and match.group(1) not in found:
+                found.append(match.group(1))
+    return found
+
+
+def default_route_interface() -> str | None:
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "route", "show", "default"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    match = re.search(r"\bdev\s+(\S+)", result.stdout)
+    return match.group(1) if match else None
+
+
+def validate_interface(value: Any, field: str) -> str | None:
+    if value in AUTO_VALUES:
+        return None
+    if not isinstance(value, str) or not INTERFACE_RE.fullmatch(value):
+        raise NetworkConfigError(f"{field} must be 'auto' or a valid Linux interface name")
+    return value
+
+
+def select_interfaces(
+    candidates: list[str],
+    configured_upstream: Any = "auto",
+    configured_downstream: Any = "auto",
+    configured_dhcp_interfaces: Iterable[str] = (),
+    current_default_route: str | None = None,
+) -> tuple[str, str]:
+    if not candidates:
+        raise NetworkConfigError("no non-loopback network interfaces were detected")
+
+    upstream = validate_interface(configured_upstream, "upstream_interface")
+    downstream = validate_interface(configured_downstream, "dhcp.interface")
+
+    if upstream is None:
+        upstream = next((name for name in configured_dhcp_interfaces if name in candidates), None)
+    if upstream is None and current_default_route in candidates:
+        upstream = current_default_route
+    if upstream is None:
+        upstream = candidates[0]
+    if upstream not in candidates:
+        raise NetworkConfigError(f"configured upstream interface does not exist: {upstream}")
+    if not INTERFACE_RE.fullmatch(upstream):
+        raise NetworkConfigError(f"unsupported upstream interface name: {upstream}")
+
+    if downstream is None:
+        try:
+            upstream_index = candidates.index(upstream)
+        except ValueError as exc:
+            raise NetworkConfigError(f"upstream interface is not available: {upstream}") from exc
+        ordered = candidates[upstream_index + 1 :] + candidates[:upstream_index]
+        downstream = next((name for name in ordered if name != upstream), None)
+    if downstream is None:
+        raise NetworkConfigError(
+            "DHCP is enabled but no second interface is available for the downstream network"
+        )
+    if downstream not in candidates:
+        raise NetworkConfigError(f"configured downstream interface does not exist: {downstream}")
+    if not INTERFACE_RE.fullmatch(downstream):
+        raise NetworkConfigError(f"unsupported downstream interface name: {downstream}")
+    if downstream == upstream:
+        raise NetworkConfigError("upstream and downstream interfaces must be different")
+    return upstream, downstream
+
+
+def network_values(dhcp: dict[str, Any]) -> tuple[ipaddress.IPv4Network, ipaddress.IPv4Address, ipaddress.IPv4Address, ipaddress.IPv4Address, list[ipaddress.IPv4Address]]:
+    try:
+        subnet = ipaddress.ip_network(str(dhcp["subnet"]), strict=True)
+        gateway = ipaddress.ip_address(str(dhcp["gateway"]))
+        pool_start = ipaddress.ip_address(str(dhcp["pool_start"]))
+        pool_end = ipaddress.ip_address(str(dhcp["pool_end"]))
+        dns_servers = [ipaddress.ip_address(str(item)) for item in dhcp.get("dns_servers", [gateway])]
+    except (KeyError, ValueError) as exc:
+        raise NetworkConfigError(f"invalid DHCP IPv4 configuration: {exc}") from exc
+    if not isinstance(subnet, ipaddress.IPv4Network):
+        raise NetworkConfigError("dhcp.subnet must be IPv4")
+    if subnet.prefixlen > 30:
+        raise NetworkConfigError("dhcp.subnet must provide usable IPv4 host addresses")
+    values = [gateway, pool_start, pool_end, *dns_servers]
+    if not all(isinstance(value, ipaddress.IPv4Address) for value in values):
+        raise NetworkConfigError("DHCP gateway, pool, and DNS servers must be IPv4 addresses")
+    if gateway not in subnet or pool_start not in subnet or pool_end not in subnet:
+        raise NetworkConfigError("DHCP gateway and pool must be inside the configured subnet")
+    unusable = {subnet.network_address, subnet.broadcast_address}
+    if gateway in unusable or pool_start in unusable or pool_end in unusable:
+        raise NetworkConfigError("DHCP gateway and pool endpoints must be usable host addresses")
+    if pool_start > pool_end:
+        raise NetworkConfigError("DHCP pool_start must not be greater than pool_end")
+    if gateway >= pool_start and gateway <= pool_end:
+        raise NetworkConfigError("DHCP pool must not include the gateway address")
+    return subnet, gateway, pool_start, pool_end, dns_servers  # type: ignore[return-value]
+
+
+def build_interfaces_fragment(interface: str, subnet: ipaddress.IPv4Network, gateway: ipaddress.IPv4Address) -> str:
+    return (
+        "# Managed by STOKER. Edit /etc/stoker/modules.yaml, then run stoker-network-config apply.\n"
+        f"auto {interface}\n"
+        f"allow-hotplug {interface}\n"
+        f"iface {interface} inet static\n"
+        f"    address {gateway}/{subnet.prefixlen}\n"
+    )
+
+
+def build_kea_config(
+    interface: str,
+    subnet: ipaddress.IPv4Network,
+    gateway: ipaddress.IPv4Address,
+    pool_start: ipaddress.IPv4Address,
+    pool_end: ipaddress.IPv4Address,
+    dns_servers: list[ipaddress.IPv4Address],
+    configuration: dict[str, Any],
+) -> dict[str, Any]:
+    option_data: list[dict[str, Any]] = [
+        {"name": "routers", "data": str(gateway)},
+        {"name": "domain-name-servers", "data": ", ".join(map(str, dns_servers))},
+    ]
+    domain_name = configuration.get("domain_name")
+    if domain_name:
+        option_data.append({"name": "domain-name", "data": str(domain_name)})
+    return {
+        "Dhcp4": {
+            "interfaces-config": {
+                "interfaces": [interface],
+                "dhcp-socket-type": "raw",
+            },
+            "lease-database": {
+                "type": "memfile",
+                "persist": True,
+                "name": "/var/lib/kea/kea-leases4.csv",
+            },
+            "renew-timer": int(configuration.get("renew_timer", 900)),
+            "rebind-timer": int(configuration.get("rebind_timer", 1800)),
+            "valid-lifetime": int(configuration.get("valid_lifetime", 3600)),
+            "max-valid-lifetime": int(configuration.get("max_valid_lifetime", 7200)),
+            "subnet4": [
+                {
+                    "id": int(configuration.get("subnet_id", 1)),
+                    "subnet": str(subnet),
+                    "pools": [{"pool": f"{pool_start} - {pool_end}"}],
+                    "option-data": option_data,
+                }
+            ],
+        }
+    }
+
+
+def build_bind_options(
+    subnet: ipaddress.IPv4Network,
+    configuration: dict[str, Any],
+) -> str:
+    recursion = "yes" if configuration.get("recursion", True) else "no"
+    forwarders: list[str] = []
+    for raw in configuration.get("forwarders", []):
+        try:
+            forwarders.append(str(ipaddress.ip_address(str(raw))))
+        except ValueError as exc:
+            raise NetworkConfigError(f"invalid DNS forwarder {raw!r}") from exc
+    policy = str(configuration.get("forward_policy", "only"))
+    if policy not in {"first", "only"}:
+        raise NetworkConfigError("dns.forward_policy must be 'first' or 'only'")
+
+    lines = [
+        "// Managed by STOKER. Edit /etc/stoker/modules.yaml, then run stoker-network-config apply.",
+        'acl "stoker_clients" {',
+        "    127.0.0.0/8;",
+        f"    {subnet};",
+        "};",
+        "",
+        "options {",
+        '    directory "/var/cache/bind";',
+        f"    recursion {recursion};",
+        "    allow-query { stoker_clients; };",
+        "    allow-recursion { stoker_clients; };",
+        "    listen-on { any; };",
+        "    listen-on-v6 { none; };",
+        "    dnssec-validation auto;",
+        "    auth-nxdomain no;",
+    ]
+    if forwarders:
+        lines.append("    forwarders {")
+        lines.extend(f"        {address};" for address in forwarders)
+        lines.append("    };")
+        lines.append(f"    forward {policy};")
+    lines.extend(["};", ""])
+    return "\n".join(lines)
+
+
+def build_nftables(
+    upstream: str,
+    downstream: str,
+    subnet: ipaddress.IPv4Network,
+    nat_enabled: bool,
+) -> str:
+    lines = [
+        "#!/usr/sbin/nft -f",
+        "# Managed by STOKER. Only the STOKER NAT table is replaced.",
+        "# Docker and administrator-owned nftables tables are intentionally preserved.",
+        "destroy table ip stoker_nat",
+    ]
+    if nat_enabled:
+        lines.extend(
+            [
+                "",
+                "table ip stoker_nat {",
+                "    chain postrouting {",
+                "        type nat hook postrouting priority srcnat; policy accept;",
+                f'        ip saddr {subnet} oifname "{upstream}" masquerade',
+                "    }",
+                "}",
+            ]
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+def atomic_write(path: Path, contents: str, mode: int = 0o644) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    previous = None
+    try:
+        previous = path.read_text(encoding="utf-8")
+    except OSError:
+        pass
+    if previous == contents:
+        os.chmod(path, mode)
+        return False
+    temporary = path.with_name(f".{path.name}.stoker.tmp")
+    temporary.write_text(contents, encoding="utf-8")
+    os.chmod(temporary, mode)
+    temporary.replace(path)
+    return True
+
+
+def run_checked(command: list[str], *, tolerate_missing: bool = False) -> None:
+    if shutil.which(command[0]) is None:
+        if tolerate_missing:
+            return
+        raise NetworkConfigError(f"required command not found: {command[0]}")
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise NetworkConfigError(f"command failed ({result.returncode}): {' '.join(command)}")
+
+
+def in_installer_context() -> bool:
+    return os.environ.get("STOKER_INSTALLER_CONTEXT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def validate_generated_configuration(
+    *,
+    dns_enabled: bool,
+    dhcp_enabled: bool,
+    routing_enabled: bool,
+    installer_context: bool = False,
+) -> None:
+    if dns_enabled:
+        run_checked(["named-checkconf"])
+    if dhcp_enabled:
+        run_checked(["kea-dhcp4", "-t", "/etc/kea/kea-dhcp4.conf"])
+    if routing_enabled and not installer_context:
+        run_checked(["nft", "-c", "-f", "/etc/nftables.conf"])
+    elif routing_enabled:
+        print(
+            "STOKER network: deferring nftables kernel validation until first boot",
+            file=sys.stderr,
+        )
+
+
+def nat_enabled(routing: dict[str, Any], state_path: Path) -> bool:
+    try:
+        override = state_path.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        override = ""
+    if override == "enabled":
+        return True
+    if override == "disabled":
+        return False
+    return bool(routing.get("enable_nat", False))
+
+
+def root_path(root: Path, absolute: str) -> Path:
+    return root / absolute.lstrip("/")
+
+
+def ensure_interfaces_include(root: Path) -> None:
+    interfaces = root_path(root, "/etc/network/interfaces")
+    try:
+        contents = interfaces.read_text(encoding="utf-8")
+    except OSError:
+        contents = "# Network interfaces managed by ifupdown\n\n"
+    include = "source /etc/network/interfaces.d/*"
+    if not any(
+        line.strip() in {include, "source-directory /etc/network/interfaces.d"}
+        for line in contents.splitlines()
+    ):
+        if contents and not contents.endswith("\n"):
+            contents += "\n"
+        contents += f"\n# Include STOKER downstream configuration.\n{include}\n"
+        atomic_write(interfaces, contents)
+
+
+def install_systemd(root: Path) -> None:
+    unit = """[Unit]
+Description=Render STOKER network roles and module configuration
+After=local-fs.target
+Before=network-pre.target networking.service nftables.service named.service bind9.service kea-dhcp4-server.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/stoker-network-config apply --boot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
+    atomic_write(root_path(root, "/etc/systemd/system/stoker-network-config.service"), unit)
+
+    drop_in = """[Unit]
+Requires=stoker-network-config.service
+After=stoker-network-config.service
+"""
+    for service in ("nftables.service", "named.service", "bind9.service", "kea-dhcp4-server.service"):
+        atomic_write(
+            root_path(root, f"/etc/systemd/system/{service}.d/stoker-network.conf"),
+            drop_in,
+        )
+
+
+def enable_unit(name: str) -> None:
+    if shutil.which("systemctl") is None:
+        return
+    subprocess.run(["systemctl", "enable", name], check=False, stdout=subprocess.DEVNULL)
+
+
+def apply_configuration(root: Path, boot: bool = False, validate: bool = True) -> tuple[str, str, bool]:
+    modules = load_modules(root_path(root, "/etc/stoker/modules.yaml"))
+    routing = module_config(modules, "routing")
+    dhcp = module_config(modules, "dhcp")
+    dns = module_config(modules, "dns")
+    if not (routing or dhcp or dns):
+        raise NetworkConfigError("no routing, DHCP, or DNS module is enabled")
+    if not dhcp:
+        raise NetworkConfigError("the shared network renderer currently requires the DHCP module")
+
+    candidates = list_candidate_interfaces()
+    upstream, downstream = select_interfaces(
+        candidates,
+        configured_upstream=routing.get("upstream_interface", "auto"),
+        configured_downstream=dhcp.get("interface", "auto"),
+        configured_dhcp_interfaces=dhcp_interfaces(root),
+        current_default_route=default_route_interface(),
+    )
+    subnet, gateway, pool_start, pool_end, dns_servers = network_values(dhcp)
+    state_path = root_path(root, "/etc/stoker/nat.mode")
+    use_nat = nat_enabled(routing, state_path)
+
+    atomic_write(
+        root_path(root, "/etc/stoker/network-roles.env"),
+        f"STOKER_UPSTREAM_INTERFACE={upstream}\n"
+        f"STOKER_DOWNSTREAM_INTERFACE={downstream}\n"
+        f"STOKER_DOWNSTREAM_SUBNET={subnet}\n"
+        f"STOKER_DOWNSTREAM_ADDRESS={gateway}/{subnet.prefixlen}\n"
+        f"STOKER_NAT_ENABLED={'true' if use_nat else 'false'}\n",
+        0o600,
+    )
+    ensure_interfaces_include(root)
+    atomic_write(
+        root_path(root, "/etc/network/interfaces.d/90-stoker-downstream"),
+        build_interfaces_fragment(downstream, subnet, gateway),
+    )
+
+    if dhcp:
+        kea = build_kea_config(downstream, subnet, gateway, pool_start, pool_end, dns_servers, dhcp)
+        atomic_write(
+            root_path(root, "/etc/kea/kea-dhcp4.conf"),
+            json.dumps(kea, indent=2) + "\n",
+            0o640,
+        )
+    if dns:
+        atomic_write(
+            root_path(root, "/etc/bind/named.conf.options"),
+            build_bind_options(subnet, dns),
+        )
+    if routing:
+        forwarding = "1" if routing.get("enable_ipv4_forwarding", True) else "0"
+        atomic_write(
+            root_path(root, "/etc/sysctl.d/90-stoker-routing.conf"),
+            "# Managed by STOKER.\n" f"net.ipv4.ip_forward={forwarding}\n",
+        )
+        atomic_write(
+            root_path(root, "/etc/nftables.conf"),
+            build_nftables(upstream, downstream, subnet, use_nat),
+            0o755,
+        )
+
+    install_systemd(root)
+
+    if root == Path("/") and validate:
+        validate_generated_configuration(
+            dns_enabled=bool(dns),
+            dhcp_enabled=bool(dhcp),
+            routing_enabled=bool(routing),
+            installer_context=in_installer_context(),
+        )
+        if boot:
+            run_checked(["sysctl", "--system"])
+            run_checked(["nft", "-f", "/etc/nftables.conf"])
+
+    return upstream, downstream, use_nat
+
+
+def show_status(root: Path) -> int:
+    roles = root_path(root, "/etc/stoker/network-roles.env")
+    if not roles.is_file():
+        print("STOKER network roles have not been rendered", file=sys.stderr)
+        return 1
+    print(roles.read_text(encoding="utf-8"), end="")
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    apply_parser = subparsers.add_parser("apply", help="render module configuration")
+    apply_parser.add_argument("--boot", action="store_true", help="apply sysctl and nftables rules")
+    apply_parser.add_argument("--root", type=Path, default=Path("/"), help=argparse.SUPPRESS)
+    apply_parser.add_argument("--no-validate", action="store_true", help=argparse.SUPPRESS)
+    status_parser = subparsers.add_parser("status", help="show resolved interface roles")
+    status_parser.add_argument("--root", type=Path, default=Path("/"), help=argparse.SUPPRESS)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        if args.command == "status":
+            return show_status(args.root)
+        upstream, downstream, use_nat = apply_configuration(
+            args.root,
+            boot=args.boot,
+            validate=not args.no_validate,
+        )
+        if args.root == Path("/") and not args.boot:
+            if shutil.which("systemctl"):
+                subprocess.run(["systemctl", "daemon-reload"], check=False)
+            enable_unit("stoker-network-config.service")
+            enable_unit("nftables.service")
+            modules = load_modules(Path("/etc/stoker/modules.yaml"))
+            if module_config(modules, "dns"):
+                enable_unit("named.service")
+                enable_unit("bind9.service")
+            if module_config(modules, "dhcp"):
+                enable_unit("kea-dhcp4-server.service")
+        print(
+            f"STOKER network: upstream={upstream} downstream={downstream} "
+            f"nat={'enabled' if use_nat else 'disabled'}"
+        )
+        return 0
+    except NetworkConfigError as exc:
+        print(f"stoker-network-config: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

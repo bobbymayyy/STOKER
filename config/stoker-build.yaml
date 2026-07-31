@@ -1,0 +1,86 @@
+project:
+  name: STOKER
+  version: "0.1.4"
+  architecture: amd64
+
+source_iso:
+  path: ../cache/iso/debian-13-amd64-netinst.iso
+  expected_sha256: null
+
+output:
+  directory: ../output
+  filename: "stoker-{version}-{architecture}.iso"
+  volume_id: STOKER_0_1_4
+
+paths:
+  work_directory: ../work
+  log_directory: ../logs
+  preseed_template: ../templates/preseed.cfg.j2
+  scripts_directory: ../scripts
+  iso_overlay: ../overlays/iso
+  rootfs_overlay: ../overlays/rootfs
+  repositories: repositories.yaml
+  packages: packages.yaml
+  modules: modules.yaml
+  ansible_projects: ansible-projects.yaml
+
+installer:
+  locale: en_US.UTF-8
+  keyboard: us
+  timezone: America/New_York
+  hostname: stoker
+  domain: stoker.internal
+  account:
+    username: stoker
+    full_name: STOKER Administrator
+    password_hash_env: STOKER_PASSWORD_HASH
+    disable_root: true
+    groups:
+      - audio
+      - cdrom
+      - video
+      - sudo
+      - plugdev
+      - users
+      - netdev
+  disk:
+    wipe_all_fixed_disks: false
+    encryption: luks
+    lvm: true
+    recipe: atomic
+    guided_size: max
+    volume_group: stoker-vg
+    luks_passphrase_env: STOKER_LUKS_PASSPHRASE
+    require_uefi: true
+    erase_before_encryption: false
+  installer_packages:
+    - openssh-server
+    - sudo
+    - ca-certificates
+
+network:
+  method: dhcp
+  interface: auto
+
+repository:
+  suite: stoker
+  component: main
+  trusted: true
+  sign: false
+  signing_key: null
+
+boot:
+  unattended_default: true
+  timeout_seconds: 5
+  kernel_arguments:
+    - auto=true
+    - priority=critical
+    - preseed/file=/cdrom/stoker/preseed.cfg
+
+build:
+  include_recommends: false
+  verify_downloads: true
+  regenerate_md5: true
+  preserve_original_boot_layout: true
+  redact_logs: true
+  qemu_smoke_test: false

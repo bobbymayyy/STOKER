@@ -1,0 +1,42 @@
+ansible:
+  project_root: /opt/stoker/projects
+  versions_root: /opt/stoker/.versions/projects
+  staging_root: /opt/stoker/.staging/projects
+  inventory_root: /opt/stoker/inventory
+  roles_root: /opt/stoker/roles
+  collections_root: /opt/stoker/collections
+  artifacts_root: /opt/stoker/artifacts
+  logs_root: /opt/stoker/logs/ansible
+  secrets_root: /etc/stoker/secrets
+  default_inventory: production
+  retain_versions: 3
+  validation:
+    syntax_check: true
+    lint: false
+
+projects:
+  - name: stoker-bootstrap
+    enabled: true
+    source: local
+    path: ../ansible/stoker-bootstrap
+    version: "0.1.4"
+    resolve_dependencies: true
+    default_playbook: deploy
+
+  - name: node-baseline
+    enabled: true
+    source: local
+    path: ../ansible/node-baseline
+    version: "0.1.4"
+    resolve_dependencies: true
+    default_playbook: deploy
+
+  # Runtime Git projects can be declared without embedding credentials in the ISO:
+  # - name: incident-response
+  #   enabled: true
+  #   source: git
+  #   repository: ssh://gitea@gitea.example/STOKER/incident-response.git
+  #   ref: stable
+  #   embed: false
+  #   resolve_dependencies: true
+  #   default_playbook: deploy

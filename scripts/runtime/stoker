@@ -1,0 +1,616 @@
+#!/usr/bin/python3
+from __future__ import annotations
+
+import argparse
+import grp
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+CONFIG_ENV = "STOKER_PROJECT_CONFIG"
+DEFAULT_CONFIG = Path("/etc/stoker/ansible-projects.yaml")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+class StokerProjectError(RuntimeError):
+    pass
+
+
+def load_yaml(path: Path) -> dict[str, Any]:
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError as exc:
+        raise StokerProjectError(f"Configuration not found: {path}") from exc
+    except yaml.YAMLError as exc:
+        raise StokerProjectError(f"Invalid YAML in {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise StokerProjectError(f"Expected a YAML mapping in {path}")
+    return data
+
+
+def config_path() -> Path:
+    return Path(os.environ.get(CONFIG_ENV, DEFAULT_CONFIG)).expanduser()
+
+
+def load_config() -> tuple[dict[str, Any], Path]:
+    path = config_path()
+    data = load_yaml(path)
+    settings = data.get("ansible")
+    projects = data.get("projects")
+    if not isinstance(settings, dict) or not isinstance(projects, list):
+        raise StokerProjectError("Project configuration must contain 'ansible' and 'projects'")
+    return data, path
+
+
+def path_setting(data: dict[str, Any], name: str) -> Path:
+    value = data["ansible"].get(name)
+    if not isinstance(value, str) or not value:
+        raise StokerProjectError(f"Missing ansible.{name} setting")
+    return Path(value)
+
+
+def enabled_projects(data: dict[str, Any]) -> list[dict[str, Any]]:
+    result = []
+    for project in data["projects"]:
+        if isinstance(project, dict) and project.get("enabled", True):
+            result.append(project)
+    return result
+
+
+def get_project(data: dict[str, Any], name: str) -> dict[str, Any]:
+    for project in enabled_projects(data):
+        if project.get("name") == name:
+            return project
+    raise StokerProjectError(f"Unknown or disabled project: {name}")
+
+
+def active_project_path(data: dict[str, Any], name: str) -> Path:
+    path = path_setting(data, "project_root") / name
+    if not path.exists():
+        raise StokerProjectError(f"Project is not active: {name}")
+    return path.resolve()
+
+
+def run_command(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    printable = " ".join(command)
+    print(f"+ {printable}", file=sys.stderr)
+    try:
+        return subprocess.run(command, cwd=cwd, env=env, text=True, check=check)
+    except FileNotFoundError as exc:
+        raise StokerProjectError(f"Required command is not installed: {command[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        raise StokerProjectError(f"Command failed with exit code {exc.returncode}: {printable}") from exc
+
+
+def capture(command: list[str], *, cwd: Path | None = None) -> str:
+    try:
+        result = subprocess.run(command, cwd=cwd, text=True, check=True, capture_output=True)
+    except FileNotFoundError as exc:
+        raise StokerProjectError(f"Required command is not installed: {command[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        raise StokerProjectError(f"Command failed: {' '.join(command)}{': ' + detail if detail else ''}") from exc
+    return result.stdout.strip()
+
+
+def require_root(action: str) -> None:
+    if os.geteuid() != 0:
+        raise StokerProjectError(f"{action} changes controller state and must be run with sudo")
+
+
+
+
+def normalize_permissions(path: Path, *, writable_group: bool = False) -> None:
+    try:
+        gid = grp.getgrnam("stoker").gr_gid
+    except KeyError:
+        gid = -1
+    for root, directories, files in os.walk(path, followlinks=False):
+        current = Path(root)
+        if not current.is_symlink():
+            os.chown(current, 0, gid)
+            current.chmod(0o770 if writable_group else 0o750)
+        for name in directories:
+            candidate = current / name
+            if candidate.is_symlink():
+                continue
+            os.chown(candidate, 0, gid)
+            candidate.chmod(0o770 if writable_group else 0o750)
+        for name in files:
+            candidate = current / name
+            if candidate.is_symlink():
+                continue
+            executable = bool(candidate.stat().st_mode & 0o111)
+            os.chown(candidate, 0, gid)
+            candidate.chmod(0o750 if executable else 0o640)
+
+def revision_for(path: Path) -> str:
+    git_dir = path / ".git"
+    if git_dir.exists():
+        return capture(["git", "rev-parse", "--short=12", "HEAD"], cwd=path)
+    digest = hashlib.sha256()
+    for item in sorted(path.rglob("*")):
+        if item.is_file():
+            digest.update(item.relative_to(path).as_posix().encode())
+            digest.update(item.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+def current_revision(data: dict[str, Any], name: str) -> str:
+    active = path_setting(data, "project_root") / name
+    if not active.exists():
+        return "inactive"
+    return active.resolve().name
+
+
+def project_playbooks(project_path: Path) -> list[Path]:
+    playbook_dir = project_path / "playbooks"
+    if not playbook_dir.is_dir():
+        return []
+    return sorted([*playbook_dir.glob("*.yml"), *playbook_dir.glob("*.yaml")])
+
+
+def install_requirements(data: dict[str, Any], project_path: Path) -> None:
+    requirements = project_path / "requirements.yml"
+    if not requirements.is_file():
+        return
+    contents = load_yaml(requirements)
+    roles = contents.get("roles") or []
+    collections = contents.get("collections") or []
+    if not isinstance(roles, list) or not isinstance(collections, list):
+        raise StokerProjectError(f"requirements.yml has invalid roles/collections lists: {requirements}")
+
+    dependency_root = project_path / ".stoker"
+    roles_root = dependency_root / "roles"
+    collections_root = dependency_root / "collections"
+    lock_path = dependency_root / "dependencies.lock"
+    requirements_hash = sha256(requirements)
+
+    if lock_path.is_file():
+        lock = load_yaml(lock_path)
+        roles_ready = not roles or roles_root.is_dir()
+        collections_ready = not collections or collections_root.is_dir()
+        if (
+            lock.get("requirements_sha256") == requirements_hash
+            and roles_ready
+            and collections_ready
+        ):
+            return
+
+    roles_root.mkdir(parents=True, exist_ok=True)
+    collections_root.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="stoker-galaxy-") as temp:
+        temp_path = Path(temp)
+        if roles:
+            role_req = temp_path / "roles.yml"
+            role_req.write_text(yaml.safe_dump(roles, sort_keys=False), encoding="utf-8")
+            run_command([
+                "ansible-galaxy", "role", "install", "--force",
+                "--roles-path", str(roles_root), "-r", str(role_req),
+            ])
+        if collections:
+            collection_req = temp_path / "collections.yml"
+            collection_req.write_text(yaml.safe_dump({"collections": collections}, sort_keys=False), encoding="utf-8")
+            run_command([
+                "ansible-galaxy", "collection", "install", "--force",
+                "--collections-path", str(collections_root), "-r", str(collection_req),
+            ])
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(
+        yaml.safe_dump(
+            {
+                "requirements_sha256": requirements_hash,
+                "roles": len(roles),
+                "collections": len(collections),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    normalize_permissions(dependency_root)
+
+
+def ansible_environment(data: dict[str, Any], project_path: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.setdefault("ANSIBLE_CONFIG", "/etc/ansible/ansible.cfg")
+    local_roles = project_path / ".stoker/roles"
+    local_collections = project_path / ".stoker/collections"
+    environment["ANSIBLE_ROLES_PATH"] = os.pathsep.join(
+        [str(local_roles), str(path_setting(data, "roles_root"))]
+    )
+    environment["ANSIBLE_COLLECTIONS_PATH"] = os.pathsep.join(
+        [str(local_collections), str(path_setting(data, "collections_root"))]
+    )
+    return environment
+
+
+def validate_project(data: dict[str, Any], project: dict[str, Any], project_path: Path) -> None:
+    playbooks = project_playbooks(project_path)
+    if not playbooks:
+        raise StokerProjectError(f"No playbooks found under {project_path / 'playbooks'}")
+
+    validation = data["ansible"].get("validation", {})
+    syntax_check = bool(validation.get("syntax_check", True))
+    lint = bool(validation.get("lint", False))
+    inventory = path_setting(data, "inventory_root") / data["ansible"].get("default_inventory", "production")
+    inventory_arg = inventory / "hosts.yaml" if inventory.is_dir() else inventory
+
+    environment = ansible_environment(data, project_path)
+    if syntax_check:
+        for playbook in playbooks:
+            run_command([
+                "ansible-playbook", "--syntax-check", "-i", str(inventory_arg), str(playbook)
+            ], cwd=project_path, env=environment)
+    if lint:
+        run_command(["ansible-lint", str(project_path)], cwd=project_path, env=environment)
+
+
+def atomic_activate(data: dict[str, Any], project: dict[str, Any], version_path: Path) -> None:
+    project_root = path_setting(data, "project_root")
+    project_root.mkdir(parents=True, exist_ok=True)
+    link = project_root / project["name"]
+    temporary = project_root / f".{project['name']}.next"
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(version_path)
+    os.replace(temporary, link)
+
+
+def prune_versions(data: dict[str, Any], name: str) -> None:
+    retain = int(data["ansible"].get("retain_versions", 3))
+    root = path_setting(data, "versions_root") / name
+    active = (path_setting(data, "project_root") / name).resolve()
+    versions = sorted(
+        [item for item in root.iterdir() if item.is_dir()] if root.is_dir() else [],
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    kept = 0
+    for version in versions:
+        if version.resolve() == active or kept < retain:
+            kept += 1
+            continue
+        shutil.rmtree(version)
+
+
+def activate_staged_project(data: dict[str, Any], project: dict[str, Any], staged: Path, revision: str) -> Path:
+    versions_root = path_setting(data, "versions_root") / project["name"]
+    versions_root.mkdir(parents=True, exist_ok=True)
+    destination = versions_root / revision
+    if destination.exists():
+        shutil.rmtree(staged, ignore_errors=True)
+    else:
+        os.replace(staged, destination)
+    normalize_permissions(destination)
+    install_requirements(data, destination)
+    validate_project(data, project, destination)
+    atomic_activate(data, project, destination)
+    prune_versions(data, project["name"])
+    return destination
+
+
+def sync_project(data: dict[str, Any], project: dict[str, Any]) -> None:
+    if project.get("source") != "git":
+        print(f"{project['name']}: embedded project, no remote sync configured")
+        return
+    repository = project.get("repository")
+    ref = project.get("ref", "stable")
+    if not repository:
+        raise StokerProjectError(f"Git project {project['name']} has no repository")
+
+    staging_root = path_setting(data, "staging_root")
+    staging_root.mkdir(parents=True, exist_ok=True)
+    temp = Path(tempfile.mkdtemp(prefix=f"{project['name']}-", dir=staging_root))
+    checkout = temp / "checkout"
+    try:
+        run_command(["git", "clone", "--no-tags", str(repository), str(checkout)])
+        run_command(["git", "checkout", str(ref)], cwd=checkout)
+        revision = revision_for(checkout)
+        shutil.rmtree(checkout / ".git", ignore_errors=True)
+        destination = activate_staged_project(data, project, checkout, revision)
+        print(f"{project['name']}: activated {destination.name}")
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def unpack_archive(archive: Path, destination: Path) -> None:
+    source = archive
+    temporary_tar: Path | None = None
+    if archive.name.endswith(".tar.zst") or archive.name.endswith(".tzst"):
+        temporary_tar = destination.parent / f".{archive.stem}.tar"
+        with temporary_tar.open("wb") as handle:
+            try:
+                subprocess.run(["unzstd", "-c", str(archive)], stdout=handle, check=True)
+            except FileNotFoundError as exc:
+                raise StokerProjectError("unzstd is required to import .tar.zst bundles") from exc
+            except subprocess.CalledProcessError as exc:
+                raise StokerProjectError(f"Unable to decompress {archive}") from exc
+        source = temporary_tar
+
+    destination.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(source, "r:*") as bundle:
+            root = destination.resolve()
+            for member in bundle.getmembers():
+                target = (destination / member.name).resolve()
+                if root != target and root not in target.parents:
+                    raise StokerProjectError(f"Archive contains an unsafe path: {member.name}")
+                if member.issym() or member.islnk() or member.isdev():
+                    raise StokerProjectError(f"Archive contains a forbidden special entry: {member.name}")
+            bundle.extractall(destination, filter="data")
+    finally:
+        if temporary_tar is not None:
+            temporary_tar.unlink(missing_ok=True)
+
+
+def extracted_project_root(destination: Path) -> Path:
+    entries = [item for item in destination.iterdir() if item.name not in {"__MACOSX"}]
+    if len(entries) == 1 and entries[0].is_dir():
+        return entries[0]
+    return destination
+
+
+def import_bundle(data: dict[str, Any], bundle_path: Path) -> None:
+    bundle_path = bundle_path.resolve()
+    manifest_path = bundle_path / "manifest.yaml" if bundle_path.is_dir() else bundle_path
+    if manifest_path.name not in {"manifest.yaml", "manifest.yml"}:
+        raise StokerProjectError("Import expects a bundle directory or manifest.yaml path")
+    manifest = load_yaml(manifest_path)
+    entries = manifest.get("projects")
+    if not isinstance(entries, list) or not entries:
+        raise StokerProjectError("Bundle manifest must define a non-empty projects list")
+
+    staging_root = path_setting(data, "staging_root")
+    staging_root.mkdir(parents=True, exist_ok=True)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise StokerProjectError("Every bundle project entry must be a mapping")
+        name = str(entry.get("name", ""))
+        archive_name = str(entry.get("archive", ""))
+        expected = str(entry.get("sha256", "")).lower()
+        if not NAME_RE.fullmatch(name) or not archive_name or not re.fullmatch(r"[a-f0-9]{64}", expected):
+            raise StokerProjectError(f"Invalid bundle entry for project: {name or '<unnamed>'}")
+        project = get_project(data, name)
+        archive = manifest_path.parent / archive_name
+        if not archive.is_file():
+            raise StokerProjectError(f"Bundle archive is missing: {archive}")
+        actual = sha256(archive)
+        if actual != expected:
+            raise StokerProjectError(f"SHA-256 mismatch for {archive.name}: expected {expected}, received {actual}")
+
+        temp = Path(tempfile.mkdtemp(prefix=f"import-{name}-", dir=staging_root))
+        extracted = temp / "extracted"
+        try:
+            unpack_archive(archive, extracted)
+            source = extracted_project_root(extracted)
+            revision = str(entry.get("revision") or f"import-{actual[:12]}")
+            if not NAME_RE.fullmatch(revision):
+                raise StokerProjectError(f"Unsafe revision label in bundle: {revision}")
+            staged = temp / "project"
+            os.replace(source, staged)
+            destination = activate_staged_project(data, project, staged, revision)
+            print(f"{name}: imported and activated {destination.name}")
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+
+
+def resolve_inventory(data: dict[str, Any], value: str | None) -> Path:
+    inventory_root = path_setting(data, "inventory_root")
+    selected = value or data["ansible"].get("default_inventory", "production")
+    path = Path(selected)
+    if not path.is_absolute():
+        path = inventory_root / selected
+    if path.is_dir():
+        for candidate in (path / "hosts.yaml", path / "hosts.yml", path / "hosts"):
+            if candidate.exists():
+                return candidate
+    if not path.exists():
+        raise StokerProjectError(f"Inventory does not exist: {path}")
+    return path
+
+
+def resolve_playbook(project: dict[str, Any], project_path: Path, value: str | None) -> Path:
+    selected = value or project.get("default_playbook", "deploy")
+    direct = Path(str(selected))
+    if direct.is_absolute() and direct.is_file():
+        return direct
+    candidates = [
+        project_path / direct,
+        project_path / "playbooks" / direct,
+        project_path / "playbooks" / f"{direct}.yml",
+        project_path / "playbooks" / f"{direct}.yaml",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise StokerProjectError(f"Playbook not found for {project['name']}: {selected}")
+
+
+def command_list(args: argparse.Namespace, data: dict[str, Any]) -> None:
+    print(f"{'NAME':28} {'SOURCE':10} {'ACTIVE REVISION'}")
+    for project in enabled_projects(data):
+        print(f"{project['name'][:28]:28} {str(project.get('source', 'unknown'))[:10]:10} {current_revision(data, project['name'])}")
+
+
+def command_status(args: argparse.Namespace, data: dict[str, Any]) -> None:
+    project = get_project(data, args.name)
+    print(yaml.safe_dump({
+        "name": project["name"],
+        "source": project.get("source"),
+        "active_revision": current_revision(data, project["name"]),
+        "active_path": str((path_setting(data, "project_root") / project["name"]).resolve())
+        if (path_setting(data, "project_root") / project["name"]).exists() else None,
+        "repository": project.get("repository"),
+        "ref": project.get("ref"),
+    }, sort_keys=False).rstrip())
+
+
+def command_validate(args: argparse.Namespace, data: dict[str, Any]) -> None:
+    project = get_project(data, args.name)
+    path = active_project_path(data, args.name)
+    validate_project(data, project, path)
+    print(f"{args.name}: validation passed")
+
+
+def command_sync(args: argparse.Namespace, data: dict[str, Any]) -> None:
+    require_root("Project synchronization")
+    selected = enabled_projects(data) if args.all else [get_project(data, args.name)]
+    for project in selected:
+        sync_project(data, project)
+
+
+def command_run(args: argparse.Namespace, data: dict[str, Any]) -> None:
+    project = get_project(data, args.name)
+    project_path = active_project_path(data, args.name)
+    inventory = resolve_inventory(data, args.inventory)
+    playbook = resolve_playbook(project, project_path, args.playbook)
+    logs_root = path_setting(data, "logs_root")
+    logs_root.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log_path = logs_root / f"{project['name']}-{playbook.stem}-{timestamp}.log"
+
+    command = ["ansible-playbook", "-i", str(inventory), str(playbook)]
+    if args.limit:
+        command.extend(["--limit", args.limit])
+    if args.tags:
+        command.extend(["--tags", args.tags])
+    if args.check:
+        command.append("--check")
+    if args.diff:
+        command.append("--diff")
+
+    environment = ansible_environment(data, project_path)
+    print(f"Logging to {log_path}", file=sys.stderr)
+    with log_path.open("w", encoding="utf-8") as log:
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=project_path,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+        except FileNotFoundError as exc:
+            raise StokerProjectError("ansible-playbook is not installed") from exc
+        assert process.stdout is not None
+        for line in process.stdout:
+            sys.stdout.write(line)
+            log.write(line)
+        return_code = process.wait()
+    if return_code:
+        raise StokerProjectError(f"Ansible playbook failed with exit code {return_code}")
+
+
+def command_rollback(args: argparse.Namespace, data: dict[str, Any]) -> None:
+    require_root("Project rollback")
+    project = get_project(data, args.name)
+    versions_root = path_setting(data, "versions_root") / args.name
+    if not versions_root.is_dir():
+        raise StokerProjectError(f"No stored versions exist for {args.name}")
+    current = active_project_path(data, args.name)
+    versions = sorted(
+        [item for item in versions_root.iterdir() if item.is_dir() and item.resolve() != current],
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    if args.revision:
+        versions = [item for item in versions if item.name == args.revision]
+    if not versions:
+        raise StokerProjectError(f"No rollback target is available for {args.name}")
+    validate_project(data, project, versions[0])
+    atomic_activate(data, project, versions[0])
+    print(f"{args.name}: rolled back to {versions[0].name}")
+
+
+def command_import(args: argparse.Namespace, data: dict[str, Any]) -> None:
+    require_root("Project import")
+    import_bundle(data, Path(args.bundle))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="stoker", description="STOKER controller operations")
+    top = parser.add_subparsers(dest="area", required=True)
+    project = top.add_parser("project", help="Manage Ansible projects")
+    commands = project.add_subparsers(dest="command", required=True)
+
+    list_parser = commands.add_parser("list", help="List configured projects")
+    list_parser.set_defaults(func=command_list)
+
+    status = commands.add_parser("status", help="Show project state")
+    status.add_argument("name")
+    status.set_defaults(func=command_status)
+
+    validate = commands.add_parser("validate", help="Run syntax and lint validation")
+    validate.add_argument("name")
+    validate.set_defaults(func=command_validate)
+
+    sync = commands.add_parser("sync", help="Fetch and activate Git projects")
+    choice = sync.add_mutually_exclusive_group(required=True)
+    choice.add_argument("name", nargs="?")
+    choice.add_argument("--all", action="store_true")
+    sync.set_defaults(func=command_sync)
+
+    run = commands.add_parser("run", help="Run a project playbook")
+    run.add_argument("name")
+    run.add_argument("playbook", nargs="?")
+    run.add_argument("--inventory")
+    run.add_argument("--limit")
+    run.add_argument("--tags")
+    run.add_argument("--check", action="store_true")
+    run.add_argument("--diff", action="store_true")
+    run.set_defaults(func=command_run)
+
+    rollback = commands.add_parser("rollback", help="Activate a previous project revision")
+    rollback.add_argument("name")
+    rollback.add_argument("revision", nargs="?")
+    rollback.set_defaults(func=command_rollback)
+
+    importer = commands.add_parser("import", help="Import a verified offline project bundle")
+    importer.add_argument("bundle")
+    importer.set_defaults(func=command_import)
+    return parser
+
+
+def main() -> int:
+    try:
+        args = build_parser().parse_args()
+        data, _ = load_config()
+        args.func(args, data)
+        return 0
+    except StokerProjectError as exc:
+        print(f"stoker: ERROR: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("stoker: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,56 @@
+#!/bin/sh
+set -eu
+
+MODE_FILE=/etc/stoker/nat.mode
+CONFIG=/usr/local/sbin/stoker-network-config
+
+usage() {
+    echo "Usage: stoker-nat {enable|disable|reset|status}" >&2
+    exit 2
+}
+
+apply_mode() {
+    requested=$1
+    had_previous=false
+    previous=
+    if [ -f "$MODE_FILE" ]; then
+        had_previous=true
+        previous=$(cat "$MODE_FILE")
+    fi
+
+    if [ "$requested" = reset ]; then
+        rm -f "$MODE_FILE"
+    else
+        printf '%s\n' "$requested" > "$MODE_FILE"
+    fi
+
+    if ! "$CONFIG" apply --boot; then
+        if [ "$had_previous" = true ]; then
+            printf '%s\n' "$previous" > "$MODE_FILE"
+        else
+            rm -f "$MODE_FILE"
+        fi
+        echo "STOKER NAT state was rolled back because network validation failed" >&2
+        exit 1
+    fi
+}
+
+[ "$#" -eq 1 ] || usage
+case "$1" in
+    enable)
+        apply_mode enabled
+        echo "STOKER NAT enabled"
+        ;;
+    disable)
+        apply_mode disabled
+        echo "STOKER NAT disabled"
+        ;;
+    reset)
+        apply_mode reset
+        echo "STOKER NAT reset to modules.yaml default"
+        ;;
+    status)
+        "$CONFIG" status
+        ;;
+    *) usage ;;
+esac

@@ -1,0 +1,12 @@
+---
+- name: Validate STOKER managed nodes
+  hosts: all
+  become: false
+  gather_facts: true
+  tasks:
+    - name: Verify Ansible connectivity
+      ansible.builtin.ping:
+
+    - name: Report managed-node identity
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} is reachable as {{ ansible_facts.user_id }} on {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}."

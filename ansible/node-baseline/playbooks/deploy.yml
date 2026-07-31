@@ -1,0 +1,38 @@
+---
+- name: Apply the STOKER node baseline
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Require a Debian-family managed node
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.os_family == "Debian"
+        fail_msg: "node-baseline currently supports Debian-family nodes only."
+
+    - name: Install baseline management packages
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - openssh-server
+          - python3
+          - sudo
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create the STOKER managed-node state directory
+      ansible.builtin.file:
+        path: /var/lib/stoker
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Record the controller that last applied the baseline
+      ansible.builtin.copy:
+        dest: /var/lib/stoker/controller
+        content: "{{ lookup('ansible.builtin.env', 'STOKER_CONTROLLER_ID') | default('stoker', true) }}\n"
+        owner: root
+        group: root
+        mode: "0644"

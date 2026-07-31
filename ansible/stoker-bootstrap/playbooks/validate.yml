@@ -1,0 +1,8 @@
+---
+- name: Validate STOKER controller reachability
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Exercise the local Ansible execution path
+      ansible.builtin.ping:

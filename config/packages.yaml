@@ -1,0 +1,37 @@
+package_groups:
+  base:
+    enabled: true
+    packages:
+      - amd64-microcode
+      - intel-microcode
+      - bash-completion
+      - ca-certificates
+      - curl
+      - git
+      - jq
+      - less
+      - openssh-server
+      - rsync
+      - sudo
+      - tmux
+      - vim
+      - wget
+
+  diagnostics:
+    enabled: true
+    packages:
+      - dnsutils
+      - ethtool
+      - iproute2
+      - iputils-ping
+      - lsof
+      - net-tools
+      - nftables
+      - pciutils
+      - procps
+      - qemu-guest-agent
+      - strace
+      - tcpdump
+      - usbutils
+
+exclude: []

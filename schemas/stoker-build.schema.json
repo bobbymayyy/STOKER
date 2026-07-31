@@ -1,0 +1,367 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "STOKER ISO build configuration",
+  "type": "object",
+  "required": [
+    "project",
+    "source_iso",
+    "output",
+    "paths",
+    "installer",
+    "network",
+    "repository",
+    "boot",
+    "build"
+  ],
+  "properties": {
+    "project": {
+      "type": "object",
+      "required": [
+        "name",
+        "version",
+        "architecture"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "architecture": {
+          "enum": [
+            "amd64"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "source_iso": {
+      "type": "object",
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "output": {
+      "type": "object",
+      "required": [
+        "directory",
+        "filename",
+        "volume_id"
+      ],
+      "properties": {
+        "directory": {
+          "type": "string"
+        },
+        "filename": {
+          "type": "string",
+          "minLength": 1
+        },
+        "volume_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        }
+      },
+      "additionalProperties": false
+    },
+    "paths": {
+      "type": "object",
+      "required": [
+        "work_directory",
+        "log_directory",
+        "preseed_template",
+        "scripts_directory",
+        "repositories",
+        "packages",
+        "modules",
+        "ansible_projects"
+      ],
+      "properties": {
+        "work_directory": {
+          "type": "string"
+        },
+        "log_directory": {
+          "type": "string"
+        },
+        "preseed_template": {
+          "type": "string"
+        },
+        "scripts_directory": {
+          "type": "string"
+        },
+        "iso_overlay": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rootfs_overlay": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repositories": {
+          "type": "string"
+        },
+        "packages": {
+          "type": "string"
+        },
+        "modules": {
+          "type": "string"
+        },
+        "ansible_projects": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "installer": {
+      "type": "object",
+      "required": [
+        "locale",
+        "keyboard",
+        "timezone",
+        "hostname",
+        "domain",
+        "account",
+        "disk",
+        "installer_packages"
+      ],
+      "properties": {
+        "locale": {
+          "type": "string"
+        },
+        "keyboard": {
+          "type": "string"
+        },
+        "timezone": {
+          "type": "string"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "domain": {
+          "type": "string"
+        },
+        "account": {
+          "type": "object",
+          "required": [
+            "username",
+            "full_name",
+            "password_hash_env",
+            "disable_root",
+            "groups"
+          ],
+          "properties": {
+            "username": {
+              "type": "string",
+              "pattern": "^[a-z_][a-z0-9_-]*$"
+            },
+            "full_name": {
+              "type": "string"
+            },
+            "password_hash_env": {
+              "type": "string"
+            },
+            "disable_root": {
+              "const": true
+            },
+            "groups": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": false
+        },
+        "disk": {
+          "type": "object",
+          "required": [
+            "wipe_all_fixed_disks",
+            "encryption",
+            "lvm",
+            "recipe",
+            "guided_size",
+            "volume_group",
+            "luks_passphrase_env",
+            "require_uefi",
+            "erase_before_encryption"
+          ],
+          "properties": {
+            "wipe_all_fixed_disks": {
+              "type": "boolean"
+            },
+            "encryption": {
+              "enum": [
+                "luks"
+              ]
+            },
+            "lvm": {
+              "const": true
+            },
+            "recipe": {
+              "enum": [
+                "atomic"
+              ]
+            },
+            "guided_size": {
+              "enum": [
+                "max"
+              ]
+            },
+            "volume_group": {
+              "type": "string"
+            },
+            "luks_passphrase_env": {
+              "type": "string"
+            },
+            "require_uefi": {
+              "type": "boolean"
+            },
+            "erase_before_encryption": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        "installer_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "network": {
+      "type": "object",
+      "required": [
+        "method",
+        "interface"
+      ],
+      "properties": {
+        "method": {
+          "enum": [
+            "dhcp"
+          ]
+        },
+        "interface": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "repository": {
+      "type": "object",
+      "required": [
+        "suite",
+        "component",
+        "trusted",
+        "sign",
+        "signing_key"
+      ],
+      "properties": {
+        "suite": {
+          "type": "string"
+        },
+        "component": {
+          "type": "string"
+        },
+        "trusted": {
+          "type": "boolean"
+        },
+        "sign": {
+          "type": "boolean"
+        },
+        "signing_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "boot": {
+      "type": "object",
+      "required": [
+        "unattended_default",
+        "timeout_seconds",
+        "kernel_arguments"
+      ],
+      "properties": {
+        "unattended_default": {
+          "type": "boolean"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60
+        },
+        "kernel_arguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "build": {
+      "type": "object",
+      "required": [
+        "include_recommends",
+        "verify_downloads",
+        "regenerate_md5",
+        "preserve_original_boot_layout",
+        "redact_logs",
+        "qemu_smoke_test"
+      ],
+      "properties": {
+        "include_recommends": {
+          "type": "boolean"
+        },
+        "verify_downloads": {
+          "type": "boolean"
+        },
+        "regenerate_md5": {
+          "type": "boolean"
+        },
+        "preserve_original_boot_layout": {
+          "const": true
+        },
+        "redact_logs": {
+          "type": "boolean"
+        },
+        "qemu_smoke_test": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
