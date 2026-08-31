@@ -214,7 +214,8 @@
             },
             "encryption": {
               "enum": [
-                "luks"
+                "luks",
+                "none"
               ]
             },
             "lvm": {
@@ -264,13 +265,53 @@
       "properties": {
         "method": {
           "enum": [
-            "dhcp"
+            "dhcp",
+            "static"
           ]
         },
         "interface": {
           "type": "string"
+        },
+        "ip_address": {
+          "type": "string",
+          "minLength": 1
+        },
+        "netmask": {
+          "type": "string",
+          "minLength": 1
+        },
+        "gateway": {
+          "type": "string",
+          "minLength": 1
+        },
+        "nameservers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
         }
       },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "static"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "ip_address",
+              "netmask",
+              "gateway",
+              "nameservers"
+            ]
+          }
+        }
+      ],
       "additionalProperties": false
     },
     "repository": {
